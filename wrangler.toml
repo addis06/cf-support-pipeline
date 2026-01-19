@@ -20,7 +20,12 @@ database_id = "3309d41b-490a-4009-ba28-04fbc2d76797"
 
 binding = "AI"
 
-# 3. The Queue (Message Queue) - Optional, requires paid plan
+# 3. Vectorize (Vector Database for RAG)
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "support-feedback-index"
+
+# 4. The Queue (Message Queue) - Optional, requires paid plan
 # Uncomment when you upgrade to Workers Paid plan to enable queue processing
 # [[queues.consumers]]
 # queue = "support-queue"

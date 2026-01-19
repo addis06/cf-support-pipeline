@@ -16,18 +16,133 @@ interface ComplaintMessage {
 interface Env {
 	DB: D1Database;
 	AI: Ai;
+	VECTORIZE: VectorizeIndex;
 }
 
 /**
- * Shared function to process a complaint message
+ * Generate embedding vector for text using Workers AI
+ */
+async function generateEmbedding(text: string, env: Env): Promise<number[]> {
+	try {
+		const embeddingResponse = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+			text: text, // Can be string or string[], using string directly
+			pooling: 'mean', // Use mean pooling for compatibility
+		});
+		
+		// Handle union type: check if it's async response or regular response
+		if ('request_id' in embeddingResponse) {
+			console.error('Received async response - this model may require async handling');
+			return [];
+		}
+		
+		// Type guard for regular response
+		const response = embeddingResponse as { data?: number[][]; shape?: number[]; pooling?: string };
+		
+		if (response && response.data && response.data[0]) {
+			return Array.from(response.data[0]);
+		}
+		throw new Error('No embedding data returned');
+	} catch (error) {
+		console.error('Error generating embedding:', error);
+		// Fallback: return empty array, RAG will be skipped
+		return [];
+	}
+}
+
+/**
+ * Find similar complaints using RAG (Retrieval Augmented Generation)
+ */
+async function findSimilarComplaints(
+	queryText: string,
+	env: Env,
+	topK: number = 3
+): Promise<Array<{ id: string; score: number; metadata: any }>> {
+	try {
+		console.log('RAG: Generating embedding for query...');
+		// Generate embedding for the query
+		const queryEmbedding = await generateEmbedding(queryText, env);
+		
+		if (queryEmbedding.length === 0) {
+			console.log('RAG: Embedding generation failed, skipping RAG search');
+			return [];
+		}
+
+		console.log(`RAG: Embedding generated (${queryEmbedding.length} dimensions), searching Vectorize...`);
+		// Search Vectorize for similar complaints
+		const searchResults = await env.VECTORIZE.query(queryEmbedding, {
+			topK: topK,
+			returnMetadata: true,
+		});
+
+		console.log(`RAG: Found ${searchResults.matches.length} similar complaints`);
+		return searchResults.matches.map(match => ({
+			id: match.id,
+			score: match.score || 0,
+			metadata: match.metadata || {},
+		}));
+	} catch (error) {
+		console.error('Error in RAG search:', error);
+		return [];
+	}
+}
+
+/**
+ * Store complaint embedding in Vectorize for future RAG searches
+ */
+async function storeComplaintEmbedding(
+	complaintId: string,
+	text: string,
+	metadata: {
+		customer_email: string;
+		normalized_key: string;
+		sentiment: string;
+		answer_type: string;
+	},
+	env: Env
+): Promise<void> {
+	try {
+		console.log(`RAG: Storing embedding for complaint ${complaintId}...`);
+		const embedding = await generateEmbedding(text, env);
+		
+		if (embedding.length === 0) {
+			console.warn('RAG: Skipping vector storage - embedding generation failed');
+			return;
+		}
+
+		await env.VECTORIZE.insert([
+			{
+				id: complaintId,
+				values: embedding,
+				metadata: {
+					text: text.substring(0, 500), // Store truncated text in metadata
+					customer_email: metadata.customer_email,
+					normalized_key: metadata.normalized_key,
+					sentiment: metadata.sentiment,
+					answer_type: metadata.answer_type,
+					timestamp: new Date().toISOString(),
+				},
+			},
+		]);
+		console.log(`RAG: Successfully stored embedding for complaint ${complaintId}`);
+	} catch (error) {
+		console.error('RAG: Error storing complaint embedding:', error);
+		// Don't throw - RAG is enhancement, not critical
+	}
+}
+
+/**
+ * Shared function to process a complaint message with RAG enhancement
  * Used by both HTTP POST endpoint and Queue consumer
  */
 async function processComplaint(
 	complaint: ComplaintMessage,
 	env: Env
-): Promise<{ success: boolean; normalized_key: string; sentiment: string; answer_type: string; emailResponse: string }> {
+): Promise<{ success: boolean; normalized_key: string; sentiment: string; answer_type: string; emailResponse: string; similarComplaints?: any[] }> {
 	const { customer_email, text } = complaint;
 
+	// Step 0: RAG - Find similar complaints to enhance solution lookup
+	const similarComplaints = await findSimilarComplaints(text, env, 3);
+	
 	// Step 1: Use AI to categorize and detect sentiment
 	const aiPrompt = `Analyze the following customer support message and provide:
 1. Category: one of "billing", "technical", or "general"
@@ -72,8 +187,9 @@ Respond in JSON format:
 		}
 	}
 
-	// Step 2: Check the Solutions table for a matching normalized_key
-	const solutionResult = await env.DB.prepare(
+	// Step 2: Enhanced solution lookup with RAG
+	// First, try exact match in Solutions table
+	let solutionResult = await env.DB.prepare(
 		'SELECT solution_text FROM Solutions WHERE normalized_key = ?'
 	)
 		.bind(normalized_key)
@@ -83,9 +199,34 @@ Respond in JSON format:
 	let answer_type: string;
 
 	if (solutionResult && solutionResult.solution_text) {
-		// Found a solution in the database
+		// Found exact solution match
 		emailResponse = solutionResult.solution_text;
 		answer_type = 'KNOWN_SOLUTION';
+	} else if (similarComplaints.length > 0 && similarComplaints[0].score > 0.7) {
+		// RAG found highly similar complaint - use its solution if available
+		const bestMatch = similarComplaints[0];
+		if (bestMatch.metadata.answer_type === 'KNOWN_SOLUTION') {
+			// Look up the solution from the similar complaint's category
+			const ragSolution = await env.DB.prepare(
+				'SELECT solution_text FROM Solutions WHERE normalized_key = ?'
+			)
+				.bind(bestMatch.metadata.normalized_key)
+				.first<{ solution_text: string }>();
+			
+			if (ragSolution && ragSolution.solution_text) {
+				emailResponse = ragSolution.solution_text;
+				answer_type = 'KNOWN_SOLUTION';
+				console.log(`RAG: Used solution from similar complaint (score: ${bestMatch.score.toFixed(2)})`);
+			} else {
+				// Fallback to stock reply
+				emailResponse = `Thank you for contacting support. We have received your message regarding "${normalized_key}" and will get back to you soon.`;
+				answer_type = 'STOCK';
+			}
+		} else {
+			// Similar complaint but no solution - use stock reply
+			emailResponse = `Thank you for contacting support. We have received your message regarding "${normalized_key}" and will get back to you soon.`;
+			answer_type = 'STOCK';
+		}
 	} else {
 		// No solution found, send stock reply
 		emailResponse = `Thank you for contacting support. We have received your message regarding "${normalized_key}" and will get back to you soon.`;
@@ -100,7 +241,7 @@ Respond in JSON format:
 	console.log('==================');
 
 	// Step 4: Insert the final result into the Complaints table
-	await env.DB.prepare(
+	const insertResult = await env.DB.prepare(
 		`INSERT INTO Complaints 
 		(customer_email, text, sentiment, normalized_key, answer_type, answered) 
 		VALUES (?, ?, ?, ?, ?, ?)`
@@ -108,12 +249,31 @@ Respond in JSON format:
 		.bind(customer_email, text, sentiment, normalized_key, answer_type, true)
 		.run();
 
+	// Step 5: Store complaint embedding in Vectorize for future RAG searches
+	const complaintId = `complaint-${Date.now()}-${insertResult.meta.last_row_id}`;
+	await storeComplaintEmbedding(
+		complaintId,
+		text,
+		{
+			customer_email,
+			normalized_key,
+			sentiment,
+			answer_type,
+		},
+		env
+	);
+
 	return {
 		success: true,
 		normalized_key,
 		sentiment,
 		answer_type,
 		emailResponse,
+		similarComplaints: similarComplaints.map(c => ({
+			score: c.score,
+			category: c.metadata.normalized_key,
+			sentiment: c.metadata.sentiment,
+		})),
 	};
 }
 
