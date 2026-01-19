@@ -1,0 +1,29 @@
+name = "cf-support-pipeline"
+
+main = "src/index.ts"
+
+compatibility_date = "2025-09-27"
+
+# 1. The Database (Filing Cabinet)
+
+[[d1_databases]]
+
+binding = "DB" # This is how we call it in code
+
+database_name = "support-db"
+
+database_id = "3309d41b-490a-4009-ba28-04fbc2d76797"
+
+# 2. The AI (The Brain)
+
+[ai]
+
+binding = "AI"
+
+# 3. The Queue (Message Queue) - Optional, requires paid plan
+# Uncomment when you upgrade to Workers Paid plan to enable queue processing
+# [[queues.consumers]]
+# queue = "support-queue"
+# max_batch_size = 10
+# max_batch_timeout = 30
+
